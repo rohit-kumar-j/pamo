@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eo pipefail
+# Note: intentionally no -u flag. Conda's own activate/deactivate scripts
+# (e.g. deactivate-gcc_linux-64.sh) reference unbound variables and will
+# fail if -u is set.
 
 # =============================================================================
 # PAMO Environment Setup Script
@@ -73,6 +76,29 @@ command -v git &>/dev/null        || fail "git not found."
 
 info "Driver: $(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)"
 info "GPU:    $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
+
+# =============================================================================
+# RESOLVE PAMO_DIR EARLY (before any env changes)
+# =============================================================================
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [ -z "${PAMO_DIR}" ]; then
+  # Auto-detect: check if we're inside a pamo repo (has setup.sh + simp_cuda)
+  if [ -f "${SCRIPT_DIR}/setup.sh" ] && [ -d "${SCRIPT_DIR}/simp_cuda" ]; then
+    PAMO_DIR="${SCRIPT_DIR}"
+    info "Auto-detected pamo repo at ${PAMO_DIR}"
+  elif [ -f "$(pwd)/setup.sh" ] && [ -d "$(pwd)/simp_cuda" ]; then
+    PAMO_DIR="$(pwd)"
+    info "Auto-detected pamo repo at ${PAMO_DIR}"
+  else
+    PAMO_DIR="$(pwd)/pamo"
+    info "Will clone pamo to ${PAMO_DIR}"
+  fi
+fi
+
+# Resolve to absolute path
+PAMO_DIR="$(cd "$(dirname "${PAMO_DIR}")" 2>/dev/null && pwd)/$(basename "${PAMO_DIR}")"
+info "PAMO_DIR: ${PAMO_DIR}"
 
 # =============================================================================
 # 1. CREATE CONDA ENVIRONMENT
@@ -195,21 +221,24 @@ pip install pdmc --no-build-isolation
 ok "pdmc installed"
 
 # =============================================================================
-# 8. CLONE PAMO REPO
+# 8. CLONE PAMO REPO + INIT SUBMODULES
 # =============================================================================
-if [ -z "${PAMO_DIR}" ]; then
-  PAMO_DIR="$(pwd)/pamo"
-fi
+info "[8/10] Setting up pamo repo at ${PAMO_DIR}..."
 
-info "[8/10] Setting up pamo repo..."
 if [ -d "${PAMO_DIR}/.git" ]; then
   info "Repo already exists at ${PAMO_DIR}"
-elif [ -d "${PAMO_DIR}" ]; then
-  info "Directory exists at ${PAMO_DIR} (not a git repo)"
+elif [ -d "${PAMO_DIR}" ] && [ -f "${PAMO_DIR}/setup.sh" ]; then
+  info "Directory exists at ${PAMO_DIR} (looks like a pamo checkout)"
 else
-  git clone "${PAMO_REPO}" "${PAMO_DIR}"
+  git clone --recursive "${PAMO_REPO}" "${PAMO_DIR}"
   ok "Cloned to ${PAMO_DIR}"
 fi
+
+# Always ensure submodules are initialized (handles existing checkouts too)
+info "Initializing git submodules..."
+cd "${PAMO_DIR}"
+git submodule update --init --recursive
+ok "Submodules ready"
 
 # =============================================================================
 # 9. PATCH WARP BUILD SCRIPT
@@ -228,14 +257,31 @@ if [ -f "${WARP_BUILD}" ]; then
     ok "Already patched (no nvrtc_static references found)"
   fi
 else
-  warn "build_dll.py not found at ${WARP_BUILD} — skipping patch"
+  fail "build_dll.py not found at ${WARP_BUILD}. Git submodules may not have initialized correctly."
 fi
 
 # =============================================================================
 # 10. RUN PAMO SETUP
+#     pamo's setup.sh calls pip install for CUDA extensions (cumesh2sdf,
+#     simp_cuda) which import torch at build time. pip's build isolation
+#     creates a clean env without torch, causing "No module named 'torch'".
+#     We patch setup.sh to add --no-build-isolation to all pip install lines.
 # =============================================================================
 info "[10/10] Running pamo setup.sh..."
 cd "${PAMO_DIR}"
+
+# Patch setup.sh: add --no-build-isolation to every 'pip install' invocation
+SETUP_SH="${PAMO_DIR}/setup.sh"
+if [ -f "${SETUP_SH}" ]; then
+  # Only patch if not already patched
+  if ! grep -q "\-\-no-build-isolation" "${SETUP_SH}"; then
+    sed -i 's/pip install /pip install --no-build-isolation /g' "${SETUP_SH}"
+    ok "Patched setup.sh: added --no-build-isolation to pip commands"
+  else
+    ok "setup.sh already has --no-build-isolation"
+  fi
+fi
+
 bash setup.sh
 ok "pamo setup.sh complete"
 
@@ -288,5 +334,6 @@ else
   echo -e "${RED}============================================${NC}"
   echo -e "${RED}  Setup finished with errors (see above)${NC}"
   echo -e "${RED}============================================${NC}"
+  echo -e "${RED}run pip install \"numpy<2.0\" in env${NC}"
   exit 1
 fi
